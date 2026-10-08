@@ -50,7 +50,6 @@ function convertMfileToExcel(inputFile, outputFile, decimals)
 
         % Check if it's a matrix or constant
         if ~contains(value, '[')
-            % Try to parse as constant
             v = str2double(value);
             if ~isnan(v) && isfinite(v)
                 constNames{end+1} = name; %#ok<AGROW>
@@ -67,11 +66,9 @@ function convertMfileToExcel(inputFile, outputFile, decimals)
         end
 
         if size(M, 1) == 1
-            % 1D table
             tableNames{end+1} = name; %#ok<AGROW>
             tableValues{end+1} = M; %#ok<AGROW>
         else
-            % 2D map
             mapNames{end+1} = name; %#ok<AGROW>
             mapValues{end+1} = M; %#ok<AGROW>
         end
@@ -81,9 +78,6 @@ function convertMfileToExcel(inputFile, outputFile, decimals)
     if exist(outputFile, 'file')
         delete(outputFile);
     end
-
-    % Create empty workbook first (this creates Sheet1 by default)
-    xlswrite(outputFile, {''}, 'Constant');
 
     % Write Constant sheet
     if ~isempty(constNames)
@@ -95,11 +89,17 @@ function convertMfileToExcel(inputFile, outputFile, decimals)
             constSheet{i+1,2} = roundToDecimal(constValues(i), decimals);
         end
         xlswrite(outputFile, constSheet, 'Constant');
+    else
+        xlswrite(outputFile, {'Constant','Value'}, 'Constant');
     end
 
     % Write Table sheet
     if ~isempty(tableNames)
-        tableSheet = cell(numel(tableNames) + 1, 20);
+        maxCols = 0;
+        for i = 1:numel(tableNames)
+            maxCols = max(maxCols, size(tableValues{i}, 2) + 1);
+        end
+        tableSheet = cell(numel(tableNames) + 1, maxCols);
         tableSheet{1,1} = 'Table';
         row = 2;
         for i = 1:numel(tableNames)
@@ -111,59 +111,82 @@ function convertMfileToExcel(inputFile, outputFile, decimals)
             row = row + 1;
         end
         xlswrite(outputFile, tableSheet, 'Table');
+    else
+        xlswrite(outputFile, {'Table'}, 'Table');
     end
 
     % Write Map sheet
     if ~isempty(mapNames)
-        mapSheet = cell(100, 20); % Pre-allocate
+        % First pass: calculate total rows needed
+        totalRows = 1; % Header row
+        for i = 1:numel(mapNames)
+            M = mapValues{i};
+            totalRows = totalRows + size(M, 1) + 2; % data rows + blank row
+        end
+        
+        % Pre-allocate with exact size needed
+        maxCols = 0;
+        for i = 1:numel(mapNames)
+            maxCols = max(maxCols, size(mapValues{i}, 2) + 1);
+        end
+        
+        mapSheet = cell(totalRows, maxCols);
         mapSheet{1,1} = 'Map';
-        mapSheet{1,2} = 'Dimensions';
         row = 2;
+        
         for i = 1:numel(mapNames)
             M = mapValues{i};
             [r, c] = size(M);
 
             mapSheet{row,1} = mapNames{i};
-            mapSheet{row,2} = sprintf('%d x %d', r, c);
             row = row + 1;
 
             for rr = 1:r
                 for cc = 1:c
-                    mapSheet{row + rr - 1, cc + 1} = roundToDecimal(M(rr, cc), decimals);
+                    mapSheet{row + rr - 1, cc} = roundToDecimal(M(rr, cc), decimals);
                 end
             end
 
             row = row + r + 1;
         end
-        % Trim empty rows
-        mapSheet(row:end, :) = [];
+        
+        % Remove any trailing empty rows
+        lastRow = 1;
+        for r = size(mapSheet, 1):-1:1
+            if ~all(cellfun(@isempty, mapSheet(r, :)))
+                lastRow = r;
+                break
+            end
+        end
+        mapSheet = mapSheet(1:lastRow, :);
+        
         xlswrite(outputFile, mapSheet, 'Map');
+    else
+        xlswrite(outputFile, {'Map'}, 'Map');
     end
 
-    % Delete default Sheet1 if it exists and we created other sheets
+    % Try to remove Sheet1 if it exists
     try
-        excelApp = actxserver('Excel.Application');
-        excelApp.Visible = false;
-        excelBook = excelApp.Workbooks.Open(outputFile);
-        
-        sheetNames = {};
-        for i = 1:excelBook.Sheets.Count
-            sheetNames{i} = excelBook.Sheets.Item(i).Name;
+        if ispc
+            excelApp = actxserver('Excel.Application');
+            excelApp.Visible = false;
+            excelBook = excelApp.Workbooks.Open(outputFile);
+            
+            % Find and delete Sheet1
+            for i = 1:excelBook.Sheets.Count
+                if strcmp(excelBook.Sheets.Item(i).Name, 'Sheet1')
+                    excelBook.Sheets.Item(i).Delete();
+                    break
+                end
+            end
+            
+            excelBook.Save();
+            excelBook.Close();
+            excelApp.Quit();
+            delete(excelApp);
         end
-        
-        % Delete Sheet1 if it exists and is not the only sheet
-        sheet1Idx = find(strcmp(sheetNames, 'Sheet1'), 1);
-        if ~isempty(sheet1Idx) && excelBook.Sheets.Count > 1
-            excelBook.Sheets.Item(sheet1Idx).Delete();
-        end
-        
-        excelBook.Save();
-        excelBook.Close();
-        excelApp.Quit();
-        delete(excelApp);
     catch
-        % If ActiveX fails, just warn user
-        fprintf('Warning: Could not remove default Sheet1. Please delete manually.\n');
+        % If Sheet1 removal fails, just continue
     end
 
     fprintf('✓ Conversion complete: %s\n', outputFile);
@@ -174,7 +197,6 @@ end
 
 function M = parseMatrixString(value)
     % Parse MATLAB matrix string including multi-line matrices
-    
     value = strtrim(value);
 
     if isempty(value) || value(1) ~= '[' || value(end) ~= ']'
@@ -184,8 +206,6 @@ function M = parseMatrixString(value)
 
     % Remove brackets
     value = value(2:end-1);
-    
-    % Replace commas with spaces
     value = strrep(value, ',', ' ');
     value = strtrim(value);
 
@@ -194,32 +214,28 @@ function M = parseMatrixString(value)
         return
     end
 
-    % Split by semicolon (row separator)
     rows = regexp(value, ';', 'split');
     M = [];
 
     for r = 1:numel(rows)
         rowStr = strtrim(rows{r});
-        
+
         if isempty(rowStr)
             continue
         end
 
-        % Parse numbers in this row
         nums = sscanf(rowStr, '%f');
-        
+
         if isempty(nums)
             M = [];
             return
         end
 
-        nums = nums(:).'; % Ensure row vector
+        nums = nums(:).';
 
-        % Add to matrix
         if isempty(M)
             M = nums;
         else
-            % Check column count matches
             if numel(nums) ~= size(M, 2)
                 M = [];
                 return
@@ -230,8 +246,6 @@ function M = parseMatrixString(value)
 end
 
 function v = roundToDecimal(x, d)
-    % Round to d decimal places
-    
     if ~isfinite(x)
         v = x;
         return
